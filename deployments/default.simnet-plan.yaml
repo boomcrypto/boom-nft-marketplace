@@ -78,3 +78,11 @@ plan:
             path: contracts/nft-marketplace.clar
             clarity-version: 3
       epoch: "3.0"
+    - id: 2
+      transactions:
+        - emulated-contract-publish:
+            contract-name: sip009-nft
+            emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+            path: contracts/sip009-nft.clar
+            clarity-version: 3
+      epoch: "3.1"

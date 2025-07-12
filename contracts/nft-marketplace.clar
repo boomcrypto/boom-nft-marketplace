@@ -29,11 +29,20 @@
 (define-constant ERR_INVALID_FEE_RATE (err u3001))
 (define-constant ERR_INSUFFICIENT_FUNDS (err u3002))
 
+;; Listing control errors
+(define-constant ERR_LISTINGS_DISABLED (err u4001))
+
 ;; Marketplace fee rate in basis points (250 = 2.5%)
 (define-data-var marketplace-fee-rate uint u250)
 
+;; Flat listing fee in micro-STX (1000000 = 1 STX)
+(define-data-var listing-fee uint u0)
+
 ;; Admin wallet for fee collection
 (define-data-var admin-wallet principal contract-owner)
+
+;; Control flag to enable/disable new listings
+(define-data-var listings-enabled bool true)
 
 ;; Used for unique IDs for each listing
 (define-data-var listing-nonce uint u0)
@@ -101,6 +110,16 @@
 ;; Get current marketplace fee rate
 (define-read-only (get-marketplace-fee-rate)
   (var-get marketplace-fee-rate)
+)
+
+;; Get listing fee
+(define-read-only (get-listing-fee)
+  (var-get listing-fee)
+)
+
+;; Get listings enabled status
+(define-read-only (get-listings-enabled)
+  (var-get listings-enabled)
 )
 
 ;; Get admin wallet
@@ -178,7 +197,7 @@
 )
 
 ;; Update user reputation after transaction
-(define-private (update-user-reputation (user principal) (action (string-ascii 10)) (successful bool))
+(define-private (update-user-reputation (user principal) (action (string-ascii 15)) (successful bool))
   (let (
     (current-stats (default-to 
       {total-sales: u0, total-purchases: u0, completion-rate: u100}
@@ -273,6 +292,44 @@
   )
 )
 
+;; Set flat listing fee (only admin)
+(define-public (set-listing-fee (new-fee uint))
+  (let ((old-fee (var-get listing-fee)))
+    (asserts! (is-eq contract-owner tx-sender) ERR_UNAUTHORISED)
+    
+    ;; Analytics event for listing fee change
+    (print {
+      event: "listing-fee-changed",
+      old-fee: old-fee,
+      new-fee: new-fee,
+      changed-by: tx-sender,
+      block-height: burn-block-height
+    })
+    
+    (var-set listing-fee new-fee)
+    (ok true)
+  )
+)
+
+;; Enable or disable new listings (only admin)
+(define-public (set-listings-enabled (enabled bool))
+  (let ((old-status (var-get listings-enabled)))
+    (asserts! (is-eq contract-owner tx-sender) ERR_UNAUTHORISED)
+    
+    ;; Analytics event for listings status change
+    (print {
+      event: "listings-status-changed",
+      old-status: old-status,
+      new-status: enabled,
+      changed-by: tx-sender,
+      block-height: burn-block-height
+    })
+    
+    (var-set listings-enabled enabled)
+    (ok true)
+  )
+)
+
 ;; ==========================================
 ;; LISTING FUNCTIONS
 ;; ==========================================
@@ -290,7 +347,13 @@
   (category (string-ascii 20))
   (collection-name (optional (string-ascii 50)))
 )
-  (let ((listing-id (var-get listing-nonce)))
+  (let (
+    (listing-id (var-get listing-nonce))
+    (flat-fee (var-get listing-fee))
+    (admin (var-get admin-wallet))
+  )
+    ;; Verify that new listings are enabled
+    (asserts! (var-get listings-enabled) ERR_LISTINGS_DISABLED)
     ;; Verify that the contract of this asset is whitelisted
     (asserts! (is-whitelisted (contract-of nft-asset-contract)) ERR_ASSET_CONTRACT_NOT_WHITELISTED)
     ;; Verify that the asset is not expired
@@ -303,6 +366,12 @@
       (is-whitelisted payment-asset)
       true
     ) ERR_PAYMENT_CONTRACT_NOT_WHITELISTED)
+    
+    ;; Charge listing fee if it's greater than 0
+    (if (> flat-fee u0)
+      (try! (stx-transfer? flat-fee tx-sender admin))
+      true
+    )
     
     ;; Transfer the NFT ownership to this contract's principal
     (try! (transfer-nft
@@ -341,14 +410,33 @@
       collection-name: collection-name,
       expiry-block: (get expiry nft-asset),
       block-height: burn-block-height,
-      intended-taker: (get taker nft-asset)
+      intended-taker: (get taker nft-asset),
+      listing-fee-paid: flat-fee,
+      admin-wallet: admin
     })
+    
+    ;; Analytics event: Listing Fee Collected (if fee > 0)
+    (if (> flat-fee u0)
+      (begin
+        (print {
+          event: "listing-fee-collected",
+          listing-id: listing-id,
+          fee-amount: flat-fee,
+          fee-type: "flat",
+          seller: tx-sender,
+          admin-wallet: admin,
+          block-height: burn-block-height
+        })
+        true
+      )
+      true
+    )
     
     ;; Increment the nonce to use for the next unique listing ID
     (var-set listing-nonce (+ listing-id u1))
     
     ;; Update user reputation for listing
-    (try! (update-user-reputation tx-sender "listing" true))
+    (unwrap-panic (update-user-reputation tx-sender "listing" true))
     
     ;; Return the created listing ID
     (ok listing-id)
@@ -394,7 +482,7 @@
     (map-delete listing-metadata listing-id)
     
     ;; Update user reputation for cancellation
-    (try! (update-user-reputation tx-sender "cancellation" true))
+    (unwrap-panic (update-user-reputation tx-sender "cancellation" true))
     
     ;; Transfer the NFT from this contract's principal back to the creator's principal
     (as-contract (transfer-nft nft-asset-contract (get token-id listing) tx-sender maker))
@@ -455,21 +543,24 @@
     
     ;; Analytics event: Fee Collected
     (if (> marketplace-fee u0)
-      (print {
-        event: "fee-collected",
-        listing-id: listing-id,
-        fee-amount: marketplace-fee,
-        fee-rate: (var-get marketplace-fee-rate),
-        payment-token: "STX",
-        block-height: burn-block-height,
-        admin-wallet: admin
-      })
+      (begin
+        (print {
+          event: "fee-collected",
+          listing-id: listing-id,
+          fee-amount: marketplace-fee,
+          fee-rate: (var-get marketplace-fee-rate),
+          payment-token: "STX",
+          block-height: burn-block-height,
+          admin-wallet: admin
+        })
+        true
+      )
       true
     )
     
     ;; Update user reputations
-    (try! (update-user-reputation maker "sale" true))
-    (try! (update-user-reputation taker "purchase" true))
+    (unwrap-panic (update-user-reputation maker "sale" true))
+    (unwrap-panic (update-user-reputation taker "purchase" true))
     
     ;; Remove the NFT from the marketplace listings
     (map-delete listings listing-id)
@@ -539,21 +630,24 @@
     
     ;; Analytics event: Fee Collected (Token)
     (if (> marketplace-fee u0)
-      (print {
-        event: "fee-collected",
-        listing-id: listing-id,
-        fee-amount: marketplace-fee,
-        fee-rate: (var-get marketplace-fee-rate),
-        payment-token: payment-token-name,
-        block-height: burn-block-height,
-        admin-wallet: admin
-      })
+      (begin
+        (print {
+          event: "fee-collected",
+          listing-id: listing-id,
+          fee-amount: marketplace-fee,
+          fee-rate: (var-get marketplace-fee-rate),
+          payment-token: payment-token-name,
+          block-height: burn-block-height,
+          admin-wallet: admin
+        })
+        true
+      )
       true
     )
     
     ;; Update user reputations
-    (try! (update-user-reputation maker "sale" true))
-    (try! (update-user-reputation taker "purchase" true))
+    (unwrap-panic (update-user-reputation maker "sale" true))
+    (unwrap-panic (update-user-reputation taker "purchase" true))
     
     ;; Remove the NFT from the marketplace listings
     (map-delete listings listing-id)
@@ -573,12 +667,16 @@
   (let (
     (current-nonce (var-get listing-nonce))
     (current-fee-rate (var-get marketplace-fee-rate))
+    (current-listing-fee (var-get listing-fee))
+    (listings-enabled-status (var-get listings-enabled))
   )
     ;; Analytics event: Market Summary
     (print {
       event: "market-summary",
       total-listings-created: current-nonce,
       current-fee-rate: current-fee-rate,
+      current-listing-fee: current-listing-fee,
+      listings-enabled: listings-enabled-status,
       admin-wallet: (var-get admin-wallet),
       block-height: burn-block-height,
       contract-address: (as-contract tx-sender)
